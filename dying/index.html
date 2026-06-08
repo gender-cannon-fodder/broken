@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Halfsphere</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #06060f;
+    font-family: monospace;
+    color: #556;
+  }
+  canvas {
+    cursor: crosshair;
+    display: block;
+    width: 100%; height: 100%;
+  }
+  p {
+    position: fixed;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 12px;
+    letter-spacing: 0.05em;
+  }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<p>steer with cursor — right-click + hold → boost forward</p>
+<script>
+// ── Vector3 ───────────────────────────────────────────────────────────────────
+
+class Vector3 {
+    constructor(x, y, z) {
+        this.x = x; this.y = y; this.z = z;
+    }
+    add(o)   { return new Vector3(this.x+o.x, this.y+o.y, this.z+o.z); }
+    sub(o)   { return new Vector3(this.x-o.x, this.y-o.y, this.z-o.z); }
+    scale(s) { return new Vector3(this.x*s,   this.y*s,   this.z*s  ); }
+    negate() { return this.scale(-1); }
+    dot(o)   { return this.x*o.x + this.y*o.y + this.z*o.z; }
+    cross(o) {
+        return new Vector3(
+            this.y*o.z - this.z*o.y,
+            this.z*o.x - this.x*o.z,
+            this.x*o.y - this.y*o.x,
+        );
+    }
+    get length() { return Math.sqrt(this.dot(this)); }
+    normalize() {
+        const l = this.length;
+        return l > 1e-10 ? this.scale(1/l) : new Vector3(0, 0, 1);
+    }
+    projectOntoTangentPlane(pos) {
+        return this.sub(pos.scale(this.dot(pos)));
+    }
+    projectAndRescale(pos, targetLength) {
+        if (targetLength < 1e-10) return new Vector3(0,0,0);
+        return this.projectOntoTangentPlane(pos).normalize().scale(targetLength);
+    }
+    // Rodrigues' rotation formula.
+    rotateAround(axis, angle) {
+        const cos = Math.cos(angle), sin = Math.sin(angle);
+        return this.scale(cos)
+            .add(axis.cross(this).scale(sin))
+            .add(axis.scale(axis.dot(this) * (1 - cos)));
+    }
+    angleTo(o) {
+        return Math.acos(Math.max(-1, Math.min(1, this.dot(o))));
+    }
+    projectiveAngleTo(o) {
+        return Math.min(this.angleTo(o), this.angleTo(o.negate()));
+    }
+}
+
+// ── Entity ────────────────────────────────────────────────────────────────────
+
+class Entity {
+    constructor(pos, vel, mass, radius) {
+        this.pos = pos;       // unit vector on S²
+        this.vel = vel;       // rotation axis, perpendicular to pos
+        this.mass = mass;
+        this.radius = radius; // angular radius, radians
+        this._hasHeading      = false;
+        this._headingAngle    = 0;
+        this._headingFallback = null; // absolute tangent vec, used when vel ≈ 0
+    }
+
+    // Call once to opt this entity into the heading system.
+    initHeading(tangentVec) {
+        this._hasHeading      = true;
+        this._headingFallback = tangentVec.projectOntoTangentPlane(this.pos).normalize();
+        this._encodeAngle(this._headingFallback);
+    }
+
+    // Encode heading as an angle relative to the current vel direction.
+    _encodeAngle(hv) {
+        if (this.vel.length < 1e-10) return; // no reference; keep old angle
+        const motFwd  = this.vel.normalize().cross(this.pos); // actual motion dir
+        const motSide = this.vel.normalize();                  // 90° in tangent plane
+        this._headingAngle = Math.atan2(hv.dot(motSide), hv.dot(motFwd));
+    }
+
+    // Reconstruct heading vector from stored angle.
+    getHeadingVec() {
+        if (!this._hasHeading) return null;
+        if (this.vel.length < 1e-10) return this._headingFallback;
+        const motFwd  = this.vel.normalize().cross(this.pos);
+        const motSide = this.vel.normalize();
+        return motFwd.scale(Math.cos(this._headingAngle))
+                     .add(motSide.scale(Math.sin(this._headingAngle)));
+    }
+
+    // Rotate heading toward targetTangent by at most maxAngle radians.
+    turnToward(targetTangent, maxAngle) {
+        if (!this._hasHeading) return;
+        const hv    = this.getHeadingVec();
+        const dot   = Math.max(-1, Math.min(1, hv.dot(targetTangent)));
+        const cross = hv.cross(targetTangent).dot(this.pos);
+        const full  = Math.atan2(cross, dot);
+        const turn  = Math.sign(full) * Math.min(Math.abs(full), maxAngle);
+        const newHv = hv.rotateAround(this.pos, turn);
+        this._headingFallback = newHv;
+        this._encodeAngle(newHv);
+    }
+
+    step(dt) {
+        const momentum = this.vel.length;
+        if (momentum < 1e-10) return;
+        const actualSpeed = momentum / Math.sqrt(1 + (momentum / C) ** 2);
+        const axis = this.vel.normalize();
+        this.pos = this.pos.rotateAround(axis, actualSpeed * dt).normalize();
+        this.vel = this.vel.projectOntoTangentPlane(this.pos);
+        // Heading angle needs no update: parallel transport along a geodesic
+        // preserves the angle between a tangent vector and the geodesic direction.
+    }
+
+    applyImpulse(delta) {
+        // Read heading as a world-space vector before vel changes.
+        const hv = this._hasHeading ? this.getHeadingVec() : null;
+        const raw = this.vel.add(delta);
+        const len = raw.length;
+        this.vel = len > 1e-10
+            ? raw.projectAndRescale(this.pos, len)
+            : new Vector3(0,0,0);
+        // Re-encode angle relative to the new vel direction.
+        if (hv !== null) {
+            this._headingFallback = hv;
+            this._encodeAngle(hv);
+        }
+    }
+}
+
+// ── Collision ─────────────────────────────────────────────────────────────────
+
+function resolveCollision(a, b, restitution = 1) {
+    // n = a.pos × b.pos: the axis perpendicular to both positions.
+    // This is the axis along which their angular velocities should diverge.
+    // a.vel · n > 0 means a is moving "away" from b along this axis.
+    // a.vel · n < 0 means a is moving "toward" b — we need to resolve.
+    const n = a.pos.cross(b.pos).normalize();
+    if (n.length < 1e-10) return; // coincident or antipodal
+
+    // relSpeed > 0: moving apart — skip.
+    // relSpeed < 0: approaching — resolve.
+    const relSpeed = a.vel.sub(b.vel).dot(n);
+    if (relSpeed < 0) return;
+
+    const j = -(1 + restitution) * relSpeed / (1/a.mass + 1/b.mass);
+    a.applyImpulse(n.scale( j / a.mass));
+    b.applyImpulse(n.scale(-j / b.mass));
+}
+
+function checkAndResolve(a, b, restitution = 1) {
+    const threshold = a.radius + b.radius;
+    const directAngle = a.pos.angleTo(b.pos);
+    if (directAngle < threshold) {
+        resolveCollision(a, b, restitution);
+        return true;
+    }
+    const mirrorAngle = a.pos.angleTo(b.pos.negate());
+    if (mirrorAngle < threshold) {
+        // The mirror image sits at -b.pos. Its rotation axis is the same as b's
+        // (rotation axes are world-space vectors, unaffected by position negation).
+        // The impulse from resolveCollision is computed against the mirror's geometry
+        // (normal already accounts for the flip), so we route it straight back to b.
+        const mirror = {
+            pos: b.pos.negate(),
+            vel: b.vel,
+            mass: b.mass,
+            applyImpulse: (delta) => b.applyImpulse(delta),
+        };
+        resolveCollision(a, mirror, restitution);
+        return true;
+    }
+    return false;
+}
+
+// ── Setup ─────────────────────────────────────────────────────────────────────
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let RADIUS, CX, CY;
+
+function resize() {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+    RADIUS = Math.min(canvas.width, canvas.height) * 0.45;
+    CX = canvas.width  / 2;
+    CY = canvas.height / 2;
+}
+window.addEventListener('resize', resize);
+resize();
+
+const ship = new Entity(
+    new Vector3(0, 0, 1),
+    new Vector3(0, 0, 0),
+    1,
+    0.07,
+);
+ship.initHeading(new Vector3(0, 1, 0));
+
+// Persistent camera orientation — seeded once, integrated smoothly each frame.
+let camRight = new Vector3(1, 0, 0);
+
+const balls = [];
+const COLORS = [
+    '#ff6b6b','#ffa94d','#ffe066','#69db7c',
+    '#4dabf7','#cc5de8','#f783ac','#a9e34b',
+    '#63e6be','#74c0fc','#da77f2','#ff8787',
+];
+for (let i = 0; i < 14; i++) {
+    const theta = Math.random() * Math.PI * 2;
+    const phi   = Math.acos(2 * Math.random() - 1);
+    const pos = new Vector3(
+        Math.sin(phi)*Math.cos(theta),
+        Math.sin(phi)*Math.sin(theta),
+        Math.cos(phi),
+    );
+    const anyUp = Math.abs(pos.z) < 0.9 ? new Vector3(0,0,1) : new Vector3(1,0,0);
+    const t1 = pos.cross(anyUp).normalize();
+    const t2 = pos.cross(t1).normalize();
+    const bAngle = Math.random() * Math.PI * 2;
+    const bSpd   = 0.1 + Math.random() * 0.2;
+    const bVel   = t1.scale(Math.cos(bAngle) * bSpd).add(t2.scale(Math.sin(bAngle) * bSpd));
+    balls.push({
+        entity: new Entity(pos, bVel, 6, 0.09),
+        color:  COLORS[i % COLORS.length],
+    });
+}
+
+// Axis markers as lightweight display entities (no collision).
+const markers = [
+    { entity: new Entity(new Vector3( 1, 0, 0), new Vector3(0,0,0), Infinity, 0.03), label: '+X', color: '#f87' },
+    { entity: new Entity(new Vector3(-1, 0, 0), new Vector3(0,0,0), Infinity, 0.03), label: '−X', color: '#f87' },
+    { entity: new Entity(new Vector3( 0, 1, 0), new Vector3(0,0,0), Infinity, 0.03), label: '+Y', color: '#8f8' },
+    { entity: new Entity(new Vector3( 0,-1, 0), new Vector3(0,0,0), Infinity, 0.03), label: '−Y', color: '#8f8' },
+    { entity: new Entity(new Vector3( 0, 0, 1), new Vector3(0,0,0), Infinity, 0.03), label: '+Z', color: '#8cf' },
+    { entity: new Entity(new Vector3( 0, 0,-1), new Vector3(0,0,0), Infinity, 0.03), label: '−Z', color: '#8cf' },
+];
+
+// ── Input ─────────────────────────────────────────────────────────────────────
+
+let pointerX = CX, pointerY = CY, rmb = false;
+
+canvas.addEventListener('mousemove', e => {
+    const r = canvas.getBoundingClientRect();
+    pointerX = e.clientX - r.left;
+    pointerY = e.clientY - r.top;
+});
+canvas.addEventListener('mousedown',   e => { if (e.button === 2) rmb = true;  e.preventDefault(); });
+canvas.addEventListener('mouseup',     e => { if (e.button === 2) rmb = false; });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+// ── Loop ──────────────────────────────────────────────────────────────────────
+
+const ACCEL     = 1.2;
+const DRAG      = 0.4;
+const C         = 1.2;        // 'speed of light', radians/s
+const TURN_RATE = Math.PI;    // radians/s
+
+let last = performance.now();
+
+// Integrate camRight by the ship's rotation (axis+angle), then re-orthogonalise.
+// Call once per frame AFTER ship.step(); returns the fresh basis.
+function integrateCamBasis(rotAxis, rotAngle) {
+    const fwd = ship.pos; // already updated by step()
+    if (rotAngle > 1e-10) {
+        camRight = camRight.rotateAround(rotAxis, rotAngle);
+    }
+    // Re-orthogonalise: strip any component along fwd, renormalise.
+    camRight = camRight.projectOntoTangentPlane(fwd).normalize();
+    const up = fwd.cross(camRight).normalize();
+    return { fwd, right: camRight, up };
+}
+
+function toScreen(pos, right, up, fwd) {
+    return [
+        CX + pos.dot(right) * RADIUS,
+        CY - pos.dot(up)    * RADIUS,
+        pos.dot(fwd) >= 0,
+    ];
+}
+
+function frame(now) {
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+
+    // Capture rotation that step() is about to apply, so we can apply it to camRight too.
+    const stepSpeed = ship.vel.length;
+    const stepAxis  = stepSpeed > 1e-10 ? ship.vel.normalize() : new Vector3(0, 0, 1);
+    const stepAngle = stepSpeed * dt;
+
+    // We need the basis before step to interpret the pointer, so build it from camRight now.
+    const preFwd   = ship.pos;
+    const preRight = camRight.projectOntoTangentPlane(preFwd).normalize();
+    const preUp    = preFwd.cross(preRight).normalize();
+
+    // Turn heading toward pointer (always).
+    {
+        const dx = (pointerX - CX) / RADIUS;
+        const dy = (pointerY - CY) / RADIUS;
+        const r2 = dx*dx + dy*dy;
+        if (r2 > 1e-6) {
+            const cursorTangent = preRight.scale(dx).add(preUp.scale(-dy)).normalize();
+            ship.turnToward(cursorTangent, TURN_RATE * dt);
+        }
+    }
+
+    // Boost forward along heading (RMB held).
+    if (rmb) {
+        const hv = ship.getHeadingVec();
+        ship.applyImpulse(ship.pos.cross(hv).scale(ACCEL * dt));
+    }
+
+    ship.step(dt);
+
+    // Integrate camera basis with the rotation just applied.
+    const { fwd, right, up } = integrateCamBasis(stepAxis, stepAngle);
+
+    for (const ball of balls) {
+        ball.entity.step(dt);
+        checkAndResolve(ship, ball.entity);
+    }
+    // Ball-ball collisions.
+    for (let i = 0; i < balls.length; i++)
+        for (let j = i + 1; j < balls.length; j++)
+            checkAndResolve(balls[i].entity, balls[j].entity);
+
+    // ── Draw ─────────────────────────────────────────────────────────────────
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // World disk.
+    ctx.beginPath();
+    ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
+    ctx.fillStyle = '#0a0a14';
+    ctx.fill();
+
+    // Subtle grid lines (great circles through poles).
+    ctx.strokeStyle = 'rgba(80,90,140,0.18)';
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 6; i++) {
+        const a = (i / 6) * Math.PI;
+        ctx.beginPath();
+        ctx.moveTo(CX + Math.cos(a) * RADIUS, CY + Math.sin(a) * RADIUS);
+        ctx.lineTo(CX - Math.cos(a) * RADIUS, CY - Math.sin(a) * RADIUS);
+        ctx.stroke();
+    }
+    // Equator circle.
+    ctx.beginPath();
+    ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(80,100,200,0.25)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Ball drawing — three layers for horizon-band effect.
+    const HORIZON_BAND = 0.18;
+
+    function drawBall(ball, p, alpha) {
+        const [sx, sy] = toScreen(p, right, up, fwd);
+        const sr = ball.entity.radius * RADIUS;
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.beginPath();
+        ctx.arc(sx, sy, sr, 0, Math.PI * 2);
+        ctx.fillStyle = ball.color;
+        ctx.fill();
+        ctx.restore();
+    }
+
+    function facingPos(ball) {
+        return ball.entity.pos.dot(fwd) >= 0 ? ball.entity.pos : ball.entity.pos.negate();
+    }
+
+    function eachDrawPos(ball, cb) {
+        cb(ball.entity.pos);
+        cb(ball.entity.pos.negate());
+    }
+
+    // Layer 1: horizon-band balls peeking behind the edge.
+    for (const ball of balls) {
+        eachDrawPos(ball, p => {
+            const depth = p.dot(fwd);
+            if (depth < 0 && depth > -HORIZON_BAND) {
+                drawBall(ball, p, 0.4 * (1 + depth / HORIZON_BAND));
+            }
+        });
+    }
+
+    // Layer 2: redraw field disk to clip them, then grid on top.
+    ctx.beginPath();
+    ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
+    ctx.fillStyle = '#0a0a14';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(80,90,140,0.18)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(CX, CY, RADIUS, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(80,100,200,0.25)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Layer 3: foreground balls.
+    for (const ball of balls) {
+        eachDrawPos(ball, p => {
+            if (p.dot(fwd) >= 0) drawBall(ball, p, 1.0);
+        });
+    }
+
+    // Velocity arrow helper.
+    // pos: entity position (unit vec), vel: rotation axis.
+    // Draws a small arrow in the tangent direction of motion.
+    function drawVelArrow(pos, vel, alpha) {
+        const momentum = vel.length;
+        if (momentum < 1e-4) return;
+        const actualSpeed = momentum / Math.sqrt(1 + (momentum / C) ** 2);
+        const motionDir = pos.cross(vel.normalize()).scale(-1 /* apparently TODO we need to figure out consistencies in handedness of rules */); // tangent direction of travel
+        const mx = motionDir.dot(right);
+        const my = motionDir.dot(up);
+        const len = actualSpeed * RADIUS / 6;
+        const [sx, sy] = toScreen(pos, right, up, fwd);
+        const nx = mx / Math.sqrt(mx*mx + my*my);
+        const ny = -my / Math.sqrt(mx*mx + my*my);
+        const tx = -ny, ty = nx; // perpendicular
+        const tipX = sx + nx * len, tipY = sy + ny * len;
+        const hw = len * 0.22; // arrowhead half-width
+        ctx.save();
+        ctx.globalAlpha = alpha * 0.75;
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(tipX, tipY);
+        ctx.stroke();
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.moveTo(tipX, tipY);
+        ctx.lineTo(tipX - nx * hw*1.5 + tx * hw, tipY - ny * hw*1.5 + ty * hw);
+        ctx.lineTo(tipX - nx * hw*1.5 - tx * hw, tipY - ny * hw*1.5 - ty * hw);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+    }
+
+    // Velocity arrows for balls.
+    for (const ball of balls) {
+        eachDrawPos(ball, p => {
+            if (p.dot(fwd) >= 0) drawVelArrow(p, ball.entity.vel, 1.0);
+        });
+    }
+
+    // Markers — drawn like balls with label, horizon-band aware.
+    function drawMarker(marker, p, alpha) {
+        const [sx, sy] = toScreen(p, right, up, fwd);
+        ctx.save();
+        ctx.globalAlpha = alpha;
+        ctx.beginPath();
+        ctx.arc(sx, sy, 6, 0, Math.PI * 2);
+        ctx.fillStyle = marker.color;
+        ctx.fill();
+        ctx.font = 'bold 11px monospace';
+        ctx.fillStyle = marker.color;
+        ctx.fillText(marker.label, sx + 9, sy + 4);
+        ctx.restore();
+    }
+
+    // Marker horizon-band pass.
+    for (const marker of markers) {
+        const p = marker.entity.pos;
+        const depth = p.dot(fwd);
+        if (depth < 0 && depth > -HORIZON_BAND)
+            drawMarker(marker, p, 0.4 * (1 + depth / HORIZON_BAND));
+    }
+    // Marker foreground pass (drawn after band pass — no need to re-clip disk).
+    for (const marker of markers) {
+        const p = marker.entity.pos;
+        if (p.dot(fwd) >= 0) drawMarker(marker, p, 0.85);
+    }
+
+    // Ship.
+    const [shipX, shipY] = toScreen(ship.pos, right, up, fwd);
+    const hv    = ship.getHeadingVec();
+    const angle = Math.atan2(hv.dot(up), -hv.dot(right));
+    const s = ship.radius * RADIUS;
+    ctx.save();
+    ctx.translate(shipX, shipY);
+    ctx.rotate(angle);
+    // Glow.
+    ctx.shadowColor = '#7ef';
+    ctx.shadowBlur  = 12;
+    ctx.beginPath();
+    ctx.moveTo(-s * 1.6, 0);
+    ctx.lineTo(s * 0.8, s * 0.9);
+    ctx.lineTo(s * 0.4, 0);
+    ctx.lineTo(s * 0.8, -s * 0.9);
+    ctx.closePath();
+    ctx.fillStyle = rmb ? '#aff' : '#7ef';
+    ctx.fill();
+    ctx.restore();
+
+    drawVelArrow(ship.pos, ship.vel, 1.0);
+
+    // Thruster indicator when accelerating.
+    if (rmb) {
+        const dx = (pointerX - CX) / RADIUS;
+        const dy = (pointerY - CY) / RADIUS;
+        if (dx*dx + dy*dy <= 1) {
+            ctx.beginPath();
+            ctx.arc(pointerX, pointerY, 5, 0, Math.PI * 2);
+            ctx.fillStyle = 'rgba(150,220,255,0.6)';
+            ctx.fill();
+        }
+    }
+
+    // ── HUD ───────────────────────────────────────────────────────────────────
+
+    const shipMomentum   = ship.vel.length;
+    const shipActualSpeed = shipMomentum / Math.sqrt(1 + (shipMomentum / C) ** 2);
+    const speedFraction  = Math.min(shipActualSpeed / C, 1);
+
+    // Relativistic doppler — layered circles approximating a directional gradient.
+    // Each circle is centered off-screen; only its fringe bleeds onto the canvas,
+    // so total fill area is far smaller than a full-screen rect.
+    if (shipMomentum > 1e-4) {
+        const motFwd = ship.vel.normalize().cross(ship.pos);
+        const vx =  motFwd.dot(right);
+        const vy = -motFwd.dot(up);  // canvas y is inverted
+        const ext = Math.hypot(canvas.width, canvas.height);
+        const t   = speedFraction;
+        ctx.shadowBlur = 0;
+        for (const [df, rf, a] of [
+            [0.60, 0.60, 0.05],  // large halo — just reaches screen centre
+            [0.50, 0.40, 0.06],  // mid — covers forward third
+            [0.45, 0.25, 0.07],  // tight — forward-edge glow
+        ]) {
+            const off = df * ext, rad = rf * ext, alpha = (a * t).toFixed(3);
+            ctx.beginPath();
+            ctx.arc(CX + vx * off, CY + vy * off, rad, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(20,160,255,${alpha})`;
+            ctx.fill();
+            ctx.beginPath();
+            ctx.arc(CX - vx * off, CY - vy * off, rad, 0, Math.PI * 2);
+            ctx.fillStyle = `rgba(255,90,20,${alpha})`;
+            ctx.fill();
+        }
+    }
+
+    // Speedometer arc — 120° gauge hugging the left of the vision circle.
+    {
+        const W = 6;
+        const cx = CX, cy = CY, r = RADIUS + 6 + W / 2;
+        const A0 = 2 * Math.PI / 3;   // 120° — bottom (stopped)
+        const A1 = 4 * Math.PI / 3;   // 240° — top    (= C)
+
+        // Track.
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, A0, A1, false);
+        ctx.strokeStyle = 'rgba(80,110,160,0.25)';
+        ctx.lineWidth = W;
+        ctx.shadowBlur = 0;
+        ctx.stroke();
+
+        const fillEnd = A0 + speedFraction * (A1 - A0);
+
+        // Fill.
+        if (speedFraction > 1e-3) {
+            const hue = Math.round(200 - speedFraction * 20);   // 200 → 180
+            const lit = Math.round(50  + speedFraction * 35);   // 50% → 85%
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, A0, fillEnd, false);
+            ctx.strokeStyle = `hsl(${hue}, 100%, ${lit}%)`;
+            ctx.lineWidth   = W + 6;
+            ctx.shadowColor = `hsl(${hue}, 100%, ${lit}%)`;
+            ctx.shadowBlur  = 6 + speedFraction * 10;
+            ctx.stroke();
+            ctx.shadowBlur  = 0;
+        }
+
+        // Tick labels.
+        ctx.font      = '9px monospace';
+        ctx.fillStyle = 'rgba(100,140,200,0.5)';
+        ctx.textAlign = 'center';
+        ctx.fillText('0', cx + Math.cos(A0) * (r + W), cy + Math.sin(A0) * (r + 18) + 3);
+        ctx.fillText('C', cx + Math.cos(A1) * (r + W), cy + Math.sin(A1) * (r + 18) + 3);
+
+        // Momentum readout — tracks the needle tip.
+        ctx.font         = 'bold 20px monospace';
+        ctx.fillStyle    = 'rgba(140,190,255,0.85)';
+        ctx.textAlign    = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(
+            shipMomentum.toFixed(3),
+            cx + Math.cos(fillEnd) * (r + 38),
+            cy + Math.sin(fillEnd) * (r + 38),
+        );
+        ctx.textBaseline = 'alphabetic';
+        ctx.textAlign    = 'left';
+    }
+
+    {
+        ctx.font      = '11px monospace';
+        ctx.fillStyle = 'rgba(100,140,200,0.55)';
+        let px = 0, py = 0, pz = 0;
+        for (const e of [ship, ...balls.map(b => b.entity)]) {
+            px += e.mass * e.vel.x;
+            py += e.mass * e.vel.y;
+            pz += e.mass * e.vel.z;
+        }
+        const pMag = Math.sqrt(px*px + py*py + pz*pz);
+        ctx.fillText(`p = ${pMag.toFixed(2)}`, 14, canvas.height - 20);
+    }
+
+    requestAnimationFrame(frame);
+}
+
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
